@@ -1,0 +1,19 @@
+{
+  "name": "olehdo-mods",
+  "owner": { "name": "OlehDo" },
+  "metadata": { "description": "Личные моды Claude Code", "version": "0.1.0" },
+  "plugins": [
+    {
+      "name": "pult",
+      "description": "Пульт сессии: автокомпакт, лимиты Claude и Codex, модель и задачи Codex",
+      "version": "0.2.0",
+      "source": "./pult"
+    },
+    {
+      "name": "readiness-audit",
+      "description": "Аудит готовности продукта по каталогу пунктов с доказательствами путь:строка и отчётом в docs/READINESS.md",
+      "version": "0.1.0",
+      "source": "./readiness-audit"
+    }
+  ]
+}

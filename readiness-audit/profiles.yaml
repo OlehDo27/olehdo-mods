@@ -1,0 +1,45 @@
+catalog_version: 0.1.0
+
+# Порядок разделов в отчёте.
+areas:
+  data: Данные пользователя
+  text: Реальные тексты и файлы
+  ux: Интерфейс и ошибки
+  security: Безопасность
+  reliability: Надёжность
+  testing: Тесты
+  release: Релизы
+  maintainability: Сопровождаемость
+  ai: AI и модели
+
+profiles:
+  desktop-tool:
+    status: ready
+    description: Локальное desktop-приложение (Tauri, Electron, WPF, egui, Qt) или CLI-инструмент, работающий с файлами пользователя.
+    detect:
+      - tauri.conf.json, src-tauri/
+      - electron в package.json
+      - .csproj с WPF/WinForms, Cargo.toml с egui/iced/slint
+  ai-feature:
+    status: ready
+    description: Продукт вызывает модели — через API (openai, anthropic, ollama) или агентные CLI (codex, qwen, claude, gemini).
+    detect:
+      - SDK моделей в зависимостях
+      - запуск codex/qwen/claude/gemini как процессов
+      - каталоги prompts/, слова prompt, provider, model в коде
+  game:
+    status: planned
+    description: Игра на Unity/Godot — сейвы, производительность, локализация, краши.
+    detect:
+      - ProjectSettings/ProjectVersion.txt, Assets/
+      - project.godot
+  infra:
+    status: planned
+    description: Серверы и сервисы команды — бэкапы и восстановление, доступы, почта, сертификаты, мониторинг.
+    detect:
+      - deploy/, docker-compose, ansible, terraform
+  web-saas:
+    status: planned
+    description: Веб-сервис для внешних клиентов — аутентификация, тенанты, биллинг, API, комплаенс.
+    detect:
+      - серверный фреймворк + БД + авторизация пользователей

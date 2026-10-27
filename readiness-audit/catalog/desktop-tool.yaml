@@ -1,0 +1,800 @@
+# Пункты для локальных desktop-инструментов (Tauri/Electron/WPF/egui и т.п.).
+# Поля пункта:
+#   id         — стабильный идентификатор, по нему сверяется отчёт; не переименовывать
+#   area       — раздел отчёта (см. areas в profiles.yaml)
+#   title      — что должно быть
+#   severity   — critical | high | medium | low
+#   profiles   — к каким профилям относится
+#   check      — code (найти в коде) | test (найти тест) | config (настройки, CI, манифесты) | ask (спросить владельца)
+#   applies_if — когда пункт вообще применим; если условие ложно, статус N/A с причиной
+#   why        — что сломается без этого
+#   look_for   — где и что искать
+#   red_flags  — признаки, что пункта нет, даже если «вроде есть»
+#   evidence   — что считается доказательством статуса «есть»
+
+items:
+
+# ---------- data: целостность пользовательских данных ----------
+
+- id: data-atomic-writes
+  area: data
+  title: Пользовательские файлы пишутся атомарно
+  severity: critical
+  profiles: [desktop-tool]
+  check: code
+  why: Краш, выключение или антивирус посреди записи оставляют пустой или обрезанный файл проекта.
+  look_for:
+    - запись во временный файл рядом и затем rename/replace (std::fs::rename, tempfile persist, ReplaceFileW, write-file-atomic, File.Replace)
+    - fsync/sync_all перед rename
+    - один общий хелпер записи, через который идут все сохранения
+  red_flags:
+    - fs::write / writeFile / File.WriteAllText прямо в целевой файл
+    - часть мест сохраняет через хелпер, часть мимо него
+  evidence: хелпер атомарной записи и места его вызова; тест на прерванную запись, если есть
+
+- id: data-backup-before-destructive
+  area: data
+  title: Перед массовыми и необратимыми операциями делается бэкап с путём отката
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Массовая замена, импорт поверх или миграция формата с ошибкой портит весь проект без возможности вернуть.
+  look_for:
+    - копия файлов перед bulk-операциями, импортом, миграцией формата
+    - команда или кнопка восстановления из бэкапа
+    - откат при ошибке посреди операции (транзакция на уровне набора файлов)
+  red_flags:
+    - бэкап делается, но восстановить из него можно только руками
+    - бэкапы копятся без ротации
+  evidence: место создания бэкапа и место отката
+
+- id: data-external-change
+  area: data
+  title: Изменения файла снаружи (git pull, другой редактор) обнаруживаются до сохранения
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Приложение молча затирает чужие правки, сделанные пока файл был открыт.
+  look_for:
+    - сравнение mtime/хеша/размера при открытии и перед записью
+    - file watcher (notify, chokidar, FileSystemWatcher) и реакция на изменение
+    - диалог конфликта или перезагрузка
+  red_flags:
+    - watcher есть, но запись не проверяет актуальность
+  evidence: проверка перед записью и обработка конфликта
+
+- id: data-format-version
+  area: data
+  title: Формат проекта/сохранений версионирован, есть миграции вперёд и понятный отказ на новый формат
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Обновление приложения ломает старые проекты, а старая версия молча портит файл новой.
+  look_for:
+    - поле version/schema_version в файлах проекта
+    - функции миграции между версиями и бэкап перед миграцией
+    - ошибка «файл создан более новой версией» вместо порчи
+  red_flags:
+    - serde(default) везде вместо явной версии, поля молча теряются при пересохранении
+  evidence: чтение версии, миграция, обработка неизвестной версии; тест миграции
+
+- id: data-roundtrip
+  area: data
+  title: Импорт → экспорт проходит без потерь (кодировка, BOM, переносы, кавычки, порядок)
+  severity: high
+  profiles: [desktop-tool]
+  check: test
+  applies_if: инструмент импортирует и экспортирует файлы
+  why: Каждый цикл через инструмент незаметно меняет данные, и это всплывает в продукте, куда они уходят.
+  look_for:
+    - round-trip тесты на фикстурах с многострочными ячейками, кавычками, BOM, CRLF
+    - property-based тесты (proptest, fast-check)
+  red_flags:
+    - тесты только на «простых» строках
+  evidence: тест round-trip и его фикстуры
+
+- id: data-undo
+  area: data
+  title: Правки можно отменить (undo/redo), разрушительные действия отменяемы или подтверждаются
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Одна ошибка пользователя превращается в ручное восстановление или потерю работы.
+  look_for:
+    - стек undo/redo в редакторе, история изменений
+    - отмена для массовых операций (не только для ввода в поле)
+  red_flags:
+    - undo только встроенный у текстового поля, а операции над данными не отменяются
+  evidence: реализация undo для операций над данными
+
+- id: data-soft-delete
+  area: data
+  title: Удалённое можно вернуть (корзина, soft delete, история)
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: «Удалил случайно» становится потерей данных, а не мелкой неприятностью.
+  look_for:
+    - удаление в системную корзину (trash crate, shell.trashItem)
+    - пометка удалённым вместо физического удаления
+  red_flags:
+    - remove_file / fs.rm на пользовательских данных без подтверждения
+  evidence: реализация удаления
+
+- id: data-autosave-recovery
+  area: data
+  title: Краш не теряет несохранённую работу (автосохранение или черновик с восстановлением)
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Падение приложения стоит пользователю часов правок.
+  look_for:
+    - автосохранение по таймеру или при каждом изменении
+    - черновики/журнал и предложение восстановить при запуске
+  evidence: механизм автосохранения или восстановления
+
+- id: data-concurrent-instances
+  area: data
+  title: Два экземпляра приложения на одном проекте не затирают друг друга
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Второе окно или второй человек в общей папке перезаписывает работу первого.
+  look_for:
+    - single-instance плагин, lock-файл проекта, lease
+    - обработка «проект уже открыт»
+  evidence: блокировка или обнаружение второго экземпляра
+
+# ---------- text: реальные данные ----------
+
+- id: text-unicode
+  area: text
+  title: Эмодзи, диакритика, CJK, RTL и составные символы работают во всех полях
+  severity: high
+  profiles: [desktop-tool]
+  check: test
+  why: Обрезка посреди символа, неверная длина, кракозябры и перевёрнутый текст в реальных данных.
+  look_for:
+    - фикстуры и тесты с эмодзи (включая ZWJ-последовательности), арабским/ивритом, CJK, комбинируемыми диакритиками
+    - длина и обрезка по графемам (unicode-segmentation, Intl.Segmenter), а не по байтам/UTF-16
+    - dir="auto" или bidi-обработка в UI
+  red_flags:
+    - .len() / .length для ограничений длины видимого текста
+    - slice по байтовым индексам строк
+  evidence: тесты с такими данными; код подсчёта длины/обрезки
+
+- id: text-quotes-separators
+  area: text
+  title: Апострофы, кавычки, разделители и переводы строк внутри значений не ломают форматы
+  severity: high
+  profiles: [desktop-tool]
+  check: test
+  why: O'Brien, «ёлочки», точка с запятой или перенос в ячейке ломают CSV/JSON/командную строку.
+  look_for:
+    - сериализация только через библиотеку (csv crate, serde_json, papaparse), не склейкой строк
+    - тесты на значения с кавычками, запятыми, ; и \n
+  red_flags:
+    - format!/шаблонные строки для CSV или JSON
+    - split(',') при разборе
+  evidence: код сериализации и тесты на такие значения
+
+- id: text-legacy-encodings
+  area: text
+  title: Импорт переживает «CSV из 2009 года» — CP1251, UTF-16, BOM, разделитель «;» от Excel
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  applies_if: инструмент импортирует текстовые файлы, созданные людьми или другими программами
+  why: Пользователь получает кракозябры или молча испорченные данные вместо понятной ошибки.
+  look_for:
+    - определение кодировки (encoding_rs, chardetng, jschardet) или явный выбор при импорте
+    - обработка BOM UTF-8/UTF-16
+    - определение разделителя или настройка
+  red_flags:
+    - from_utf8_lossy / замена символов без предупреждения пользователя
+  evidence: код определения кодировки и тест с не-UTF-8 фикстурой
+
+- id: text-line-endings
+  area: text
+  title: Переводы строк (CRLF/LF/смешанные) сохраняются или нормализуются осознанно
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Каждое сохранение меняет весь файл в git-диффе или ломает формат для движка.
+  look_for:
+    - определение и сохранение исходного стиля переносов
+    - .gitattributes для данных
+  evidence: код обработки переносов или тест
+
+- id: text-windows-paths
+  area: text
+  title: Пути с пробелами, кириллицей, длиннее 260 символов, OneDrive и сетевые диски работают
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: У половины пользователей профиль «C:\Users\Олег» или проект в OneDrive, и инструмент там не запускается.
+  look_for:
+    - работа через Path/PathBuf/path.join, а не склейку строк
+    - long path (\\?\ префикс, longPathAware в манифесте) или явная проверка длины
+    - тесты/фикстуры с пробелами и кириллицей в путях
+  red_flags:
+    - to_str().unwrap() на путях
+    - пути в командной строке без экранирования
+  evidence: код работы с путями и тесты
+
+- id: text-large-inputs
+  area: text
+  title: Производительность на реальных объёмах (десятки тысяч строк, большие файлы)
+  severity: medium
+  profiles: [desktop-tool]
+  check: test
+  why: То, что мгновенно на 50 тестовых строках, виснет на 50 000 настоящих.
+  look_for:
+    - бенчмарки или тесты на больших фикстурах
+    - виртуализация списков/таблиц в UI
+    - отсутствие O(n²) в поиске, валидации, диффах
+  evidence: бенчмарк/нагрузочный тест или виртуализация в UI
+
+- id: text-locale-formats
+  area: text
+  title: Даты и числа показываются по локали, а в файлах хранятся в инвариантном формате
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Десятичная запятая и формат дат ломают разбор файлов на машинах с другой локалью.
+  look_for:
+    - Intl/chrono для отображения
+    - разбор чисел и дат из файлов без зависимости от системной локали (InvariantCulture)
+  red_flags:
+    - parseFloat на данных из UI с локализованным вводом
+  evidence: код форматирования и разбора
+
+- id: text-timezones
+  area: text
+  title: Время хранится в UTC (или с зоной), показывается в локальном
+  severity: low
+  profiles: [desktop-tool]
+  check: code
+  applies_if: приложение хранит отметки времени
+  why: Отметки времени в истории и логах сдвигаются или сравниваются неправильно.
+  look_for:
+    - chrono::Utc / toISOString / DateTimeOffset
+  evidence: место записи отметок времени
+
+# ---------- ux: состояния, ошибки, доступность ----------
+
+- id: ux-states
+  area: ux
+  title: У каждого экрана есть пустое, загрузочное и ошибочное состояние
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Пустой белый экран вместо «нет данных — импортируйте файл» или бесконечный спиннер после ошибки.
+  look_for:
+    - компоненты EmptyState/Loading/Error, обработка isLoading/error в экранах
+    - error boundary в React
+  red_flags:
+    - catch, который только логирует, а UI остаётся в загрузке
+  evidence: основные экраны и их состояния
+
+- id: ux-actionable-errors
+  area: ux
+  title: Ошибки говорят, что случилось и что делать, а детали можно скопировать
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: «Something went wrong» превращает каждую ошибку в обращение к разработчику.
+  look_for:
+    - типизированные ошибки с понятными сообщениями (thiserror, классы ошибок)
+    - преобразование внутренних ошибок в пользовательские тексты
+    - кнопка «скопировать детали» / путь к логу
+  red_flags:
+    - в UI выводится {error} или e.toString() как есть
+    - unwrap/expect в путях, доступных пользователю
+  evidence: слой преобразования ошибок и пример сообщения
+
+- id: ux-keep-input
+  area: ux
+  title: Ошибка валидации не стирает то, что пользователь ввёл
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Пользователь перепечатывает форму из-за одного неверного поля.
+  look_for:
+    - формы сохраняют состояние при ошибке, ошибка показывается у поля
+  evidence: форма с валидацией
+
+- id: ux-no-freeze
+  area: ux
+  title: Долгие операции не блокируют UI, показывают прогресс и отменяются
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Окно «не отвечает», пользователь убивает процесс посреди записи.
+  look_for:
+    - async-команды/фоновые потоки для импорта, экспорта, сети, внешних процессов
+    - прогресс и кнопка отмены (CancellationToken, AbortController, флаг отмены)
+  red_flags:
+    - синхронные тяжёлые операции в обработчиках UI или в sync Tauri-командах
+  evidence: фоновое выполнение и отмена для самой долгой операции
+
+- id: ux-keyboard-a11y
+  area: ux
+  title: Основные сценарии проходятся с клавиатуры, фокус виден, элементы подписаны для скринридера
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Редакторы работают с клавиатуры; недоступность — блокер для части пользователей и заказчиков.
+  look_for:
+    - горячие клавиши для частых действий
+    - aria-label на иконочных кнопках, видимый focus-ring
+    - eslint-plugin-jsx-a11y или axe в тестах
+  evidence: обработка клавиатуры и подписи элементов
+
+- id: ux-destructive-confirm
+  area: ux
+  title: Разрушительные действия подтверждаются с точной формулировкой, по умолчанию — безопасная кнопка
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Enter по привычке удаляет проект.
+  look_for:
+    - диалоги подтверждения с названием объекта и последствиями
+  evidence: диалог подтверждения
+
+- id: ux-notifications-off
+  area: ux
+  title: Уведомления и звуки можно выключить
+  severity: low
+  profiles: [desktop-tool]
+  check: code
+  applies_if: приложение показывает системные уведомления или играет звуки
+  why: Раздражающее уведомление заставляет удалить приложение.
+  look_for:
+    - настройка уведомлений
+  evidence: настройка и её проверка перед показом
+
+# ---------- security ----------
+
+- id: sec-secrets-repo
+  area: security
+  title: Секретов нет в коде, в репозитории и в его истории
+  severity: critical
+  profiles: [desktop-tool]
+  check: config
+  why: Ключ, который AI вставил в конфиг месяц назад, лежит в истории git навсегда.
+  look_for:
+    - поиск по шаблонам ключей (sk-, ghp_, AKIA, -----BEGIN, token=, password=) в файлах и git log -p
+    - .gitignore для .env, локальных конфигов, ключей подписи
+    - gitleaks/trufflehog в CI или pre-commit
+  red_flags:
+    - ключи подписи обновлений или токены в репозитории
+  evidence: результат поиска и .gitignore; сканер в CI, если есть
+
+- id: sec-secrets-logs
+  area: security
+  title: В логах и отчётах о падениях нет токенов, ключей и лишних пользовательских данных
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Пользователь присылает лог в чат поддержки вместе с API-ключом.
+  look_for:
+    - редактирование секретов при логировании, обёртки типа Secret<String>
+    - что логируется при ошибках внешних процессов (полная командная строка, окружение)
+  red_flags:
+    - Debug-вывод структур конфигурации с токенами
+  evidence: места логирования конфигурации и ошибок
+
+- id: sec-deps-exist
+  area: security
+  title: Каждая зависимость существует, та самая, что задумана, и зафиксирована lock-файлом
+  severity: high
+  profiles: [desktop-tool]
+  check: config
+  why: AI придумывает похожие имена пакетов, и их регистрируют злоумышленники (slopsquatting).
+  look_for:
+    - lock-файлы в репозитории (Cargo.lock, pnpm-lock.yaml)
+    - малоизвестные или опечаточные имена пакетов в манифестах
+    - зависимости из git/URL без фиксации ревизии
+  evidence: lock-файлы и список нестандартных зависимостей с вердиктом
+
+- id: sec-deps-audit
+  area: security
+  title: Зависимости проверяются на уязвимости автоматически
+  severity: high
+  profiles: [desktop-tool]
+  check: config
+  why: Уязвимость в зависимости живёт месяцами, потому что никто не смотрел.
+  look_for:
+    - cargo audit / cargo deny, pnpm audit / npm audit, dependabot/renovate
+    - запуск в CI
+  evidence: конфиг CI или dependabot
+
+- id: sec-process-spawn
+  area: security
+  title: Внешние процессы запускаются массивом аргументов, без шелла и инъекций
+  severity: critical
+  profiles: [desktop-tool]
+  check: code
+  applies_if: приложение запускает внешние программы
+  why: Данные пользователя в командной строке выполняют произвольные команды; на Windows .bat/.cmd особенно опасны (BatBadBut, CVE-2024-24576).
+  look_for:
+    - Command::new с .arg/.args, spawn с массивом, shell=false
+    - запуск .cmd/.bat (npm-шимы вроде qwen.cmd, codex.cmd) и как туда попадают аргументы
+    - передача больших/пользовательских данных через stdin или файл, а не аргументом
+    - версия Rust ≥ 1.77.2 при запуске .bat/.cmd
+  red_flags:
+    - cmd /c или sh -c со склеенной строкой
+    - пользовательский текст в аргументах .cmd-файла
+  evidence: все места запуска процессов и способ передачи данных
+
+- id: sec-path-traversal
+  area: security
+  title: Пути из данных проекта и импорта не выходят за пределы проекта
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Файл проекта с путём ../../ или абсолютным путём читает или перезаписывает что угодно на диске.
+  look_for:
+    - нормализация и проверка, что путь внутри корня (canonicalize + starts_with)
+    - обработка симлинков
+  red_flags:
+    - root.join(path_from_file) без проверки
+  evidence: функция проверки пути и места её применения
+
+- id: sec-untrusted-project
+  area: security
+  title: Открытие чужого проекта не исполняет код без явного согласия
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Команда провайдера, хук или скрипт, записанные в файл проекта, выполняются у того, кто проект открыл.
+  look_for:
+    - какие настройки проекта задают исполняемые команды, пути к программам, аргументы
+    - хранятся ли они в проекте (общий git) или в локальных настройках пользователя
+    - подтверждение/доверие к проекту перед запуском
+  evidence: где хранятся исполняемые настройки и как они доверяются
+
+- id: sec-webview
+  area: security
+  title: Webview закрыт — CSP, без удалённого контента, минимальные права IPC, данные не исполняются как HTML
+  severity: high
+  profiles: [desktop-tool]
+  check: config
+  applies_if: UI сделан на webview (Tauri, Electron, WebView2)
+  why: XSS из данных проекта в webview превращается в выполнение кода через IPC.
+  look_for:
+    - CSP в tauri.conf.json / Electron, отсутствие null
+    - capabilities/permissions Tauri, allowlist IPC-команд, scope для fs
+    - dangerouslySetInnerHTML, innerHTML, рендер markdown без санитайзера
+    - nodeIntegration/contextIsolation в Electron
+  evidence: CSP, конфиг прав и места рендера пользовательского текста
+
+- id: sec-update-signing
+  area: security
+  title: Сборки подписаны, автообновление проверяет подпись
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  applies_if: приложение распространяется бинарником
+  why: Подменённое обновление ставится всем пользователям; неподписанный exe пугает SmartScreen.
+  look_for:
+    - pubkey в конфиге updater, подпись артефактов в скрипте публикации
+    - Authenticode-подпись (signtool, azure trusted signing)
+    - где хранится приватный ключ (не в репо)
+  evidence: конфиг подписи и проверки
+
+# ---------- reliability ----------
+
+- id: rel-crash-logs
+  area: reliability
+  title: Паники и необработанные исключения пишутся в лог с версией, пользователь может его найти и отправить
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  why: Падение у пользователя невозможно воспроизвести и починить.
+  look_for:
+    - panic hook, window.onerror/unhandledrejection, логгер в файл
+    - версия приложения в логе, путь к логам в UI или документации
+  evidence: обработчики падений и место логов
+
+- id: rel-log-hygiene
+  area: reliability
+  title: Логи с уровнями и ротацией, не растут бесконечно
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Через полгода лог занимает гигабайты или его нет вовсе.
+  look_for:
+    - tracing/log с файловым appender и ротацией, уровни через настройки
+  evidence: конфигурация логирования
+
+- id: rel-subprocess-timeouts
+  area: reliability
+  title: Внешние процессы и сеть имеют таймауты, зависшие убиваются вместе с деревом, сироты не остаются
+  severity: high
+  profiles: [desktop-tool]
+  check: code
+  applies_if: приложение запускает внешние процессы или ходит в сеть
+  why: Зависший дочерний процесс держит файлы и висит вечно; на Windows kill не убивает внуков.
+  look_for:
+    - таймауты, watchdog, kill дерева процессов (Job Objects, taskkill /T)
+    - очистка при выходе из приложения
+  evidence: реализация таймаута и убийства дерева; тест с зависающим процессом
+
+- id: rel-retries
+  area: reliability
+  title: Временные сбои повторяются с backoff и лимитом, неидемпотентное не повторяется вслепую
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  applies_if: есть внешние вызовы, которые могут временно падать
+  why: Один сетевой сбой отменяет долгую задачу, или повтор дублирует результат.
+  look_for:
+    - retry с экспоненциальной задержкой и лимитом попыток
+    - различение временных и постоянных ошибок
+  evidence: код повторов
+
+- id: rel-locked-files
+  area: reliability
+  title: Занятый файл (открыт в Excel, антивирус), нехватка места и read-only обрабатываются понятной ошибкой
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: На Windows Excel держит CSV заблокированным, и сохранение падает непонятно или теряет данные.
+  look_for:
+    - обработка sharing violation / PermissionDenied / StorageFull с понятным текстом
+    - повтор записи после закрытия файла
+  evidence: обработка этих ошибок
+
+- id: rel-temp-cleanup
+  area: reliability
+  title: Временные файлы и рабочие каталоги задач чистятся
+  severity: low
+  profiles: [desktop-tool]
+  check: code
+  why: Диск пользователя заполняется мусором от каждого запуска.
+  look_for:
+    - удаление job-каталогов, tempdir с автоудалением, очистка при старте
+  evidence: код очистки
+
+# ---------- testing ----------
+
+- id: test-core-unit
+  area: testing
+  title: Ядро покрыто юнит-тестами, проверяющими задуманное поведение
+  severity: high
+  profiles: [desktop-tool]
+  check: test
+  why: Тесты, снятые со случайного текущего поведения, закрепляют баги вместо логики.
+  look_for:
+    - тесты бизнес-логики (не только UI-снапшоты)
+    - проверки граничных случаев и ошибок, а не только happy path
+  red_flags:
+    - снапшот-тесты без проверки смысла
+    - тесты, которые ничего не утверждают
+  evidence: основные тестовые модули и пример осмысленной проверки
+
+- id: test-integration-external
+  area: testing
+  title: Каждая внешняя зависимость (CLI, git, ФС, сеть) покрыта интеграционным тестом, включая сбои
+  severity: high
+  profiles: [desktop-tool]
+  check: test
+  why: Обновление внешней программы меняет её вывод, и это обнаруживают пользователи.
+  look_for:
+    - фейки/моки внешних программ и тесты на их ошибки, таймауты, мусорный вывод
+  evidence: интеграционные тесты и фейки
+
+- id: test-e2e-main-flows
+  area: testing
+  title: E2E-тесты на основные сценарии, ради которых инструмент существует
+  severity: high
+  profiles: [desktop-tool]
+  check: test
+  why: Каждый модуль по отдельности работает, а весь путь пользователя сломан.
+  look_for:
+    - e2e (Playwright, WebdriverIO, tauri-driver) или CLI-сценарии от начала до конца
+  evidence: e2e-тесты и какие сценарии они проходят
+
+- id: test-regression
+  area: testing
+  title: Исправленные баги закреплены регрессионными тестами
+  severity: medium
+  profiles: [desktop-tool]
+  check: test
+  why: Исправление бага 41 возвращает баг 12.
+  look_for:
+    - коммиты fix в git log и есть ли в них изменения тестов
+    - тесты с названиями/комментариями по багам
+  evidence: доля fix-коммитов с тестами за последние N коммитов
+
+- id: test-fixtures-realistic
+  area: testing
+  title: Тестовые данные похожи на реальные, но не являются реальными или закрытыми
+  severity: medium
+  profiles: [desktop-tool]
+  check: test
+  why: Тесты зелёные на игрушечных данных или в репозиторий утекают данные клиента.
+  look_for:
+    - фикстуры с реалистичной структурой и объёмом
+    - нет ли в фикстурах настоящих закрытых текстов, имён, контактов
+  evidence: каталог фикстур
+
+- id: test-ci
+  area: testing
+  title: CI прогоняет тесты и линтер на каждый push/PR, включая целевую ОС
+  severity: high
+  profiles: [desktop-tool]
+  check: config
+  why: Сломанная сборка доезжает до пользователей.
+  look_for:
+    - .github/workflows, другие CI-конфиги, windows-latest в матрице
+    - запуск тестов перед публикацией обновления
+  evidence: конфиг CI
+
+- id: test-min-spec
+  area: testing
+  title: Проверено на минимальной поддерживаемой машине и окружении (старое железо, Win10, масштаб 150%)
+  severity: low
+  profiles: [desktop-tool]
+  check: ask
+  why: У пользователя пятилетний ноутбук и HiDPI, а тестировали только на машине разработчика.
+  look_for:
+    - заявленные минимальные требования в README
+  evidence: ответ владельца или записи о проверке
+
+# ---------- release ----------
+
+- id: ship-reproducible-build
+  area: release
+  title: Сборка — одна документированная команда с зафиксированными версиями инструментов
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: Собрать релиз может только один человек на одной машине.
+  look_for:
+    - rust-toolchain.toml, packageManager в package.json, .nvmrc
+    - скрипт сборки релиза
+  evidence: файлы фиксации версий и скрипт сборки
+
+- id: ship-versioning-changelog
+  area: release
+  title: Версия видна в приложении, есть changelog для пользователей
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: Невозможно понять, какая версия у пользователя и что в ней поменялось.
+  look_for:
+    - показ версии в UI (окно «о программе», статус-бар)
+    - CHANGELOG.md или заметки к релизам
+  evidence: место показа версии и changelog
+
+- id: ship-rollback
+  area: release
+  title: Можно вернуться на предыдущую версию без потери данных
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: Плохое обновление нельзя откатить, или откат ломает уже мигрированные данные.
+  look_for:
+    - хранение предыдущих сборок/релизов, канал обновлений
+    - совместимость формата данных назад или бэкап перед миграцией
+  evidence: процесс публикации и хранения релизов
+
+- id: ship-installer
+  area: release
+  title: Установка без прав администратора, обновление сохраняет настройки, удаление чистое
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  applies_if: приложение распространяется установщиком
+  why: Установщик требует админа, обновление сбрасывает настройки, удаление оставляет мусор.
+  look_for:
+    - конфиг NSIS/MSI/WiX (installMode perUser), где хранятся настройки
+  evidence: конфиг установщика
+
+# ---------- maintainability ----------
+
+- id: maint-big-files
+  area: maintainability
+  title: Нет разросшихся файлов, в которые AI годами дописывает код
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  why: Файл на 2000+ строк никто не может прочитать целиком, и каждая правка ломает соседнее.
+  look_for:
+    - исходники длиннее ~1000 строк (scripts/big_files.py)
+  evidence: список крупнейших файлов с размерами
+
+- id: maint-dead-code
+  area: maintainability
+  title: Нет мёртвого кода от прошлых попыток
+  severity: low
+  profiles: [desktop-tool]
+  check: code
+  why: Брошенные версии функции путают людей и агентов, которые правят не ту.
+  look_for:
+    - allow(dead_code), неиспользуемые экспорты (knip, ts-prune, cargo udeps)
+    - закомментированные блоки, файлы *_old, *_v2, *_backup
+  evidence: найденные места или результат инструмента
+
+- id: maint-adr
+  area: maintainability
+  title: Архитектурные решения записаны вместе с причинами
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: Через год никто не помнит, почему сделано так, и решение переигрывают с теми же ошибками.
+  look_for:
+    - docs/adr, docs/architecture, разделы «почему» в ARCHITECTURE.md
+  evidence: документы с решениями и причинами
+
+- id: maint-onboarding
+  area: maintainability
+  title: По README новый разработчик запускает проект меньше чем за час
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: Каждый новый человек тратит день и отвлекает автора.
+  look_for:
+    - предпосылки с версиями, команды установки, запуска, тестов
+    - команды из README действительно есть в package.json/Cargo.toml/скриптах
+  evidence: README и сверка команд
+
+- id: maint-deps-fresh
+  area: maintainability
+  title: Зависимости и фреймворки не отстают на мажорные версии и ещё получают патчи
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: Через год обновление превращается в переписывание, а уязвимости уже не чинят.
+  look_for:
+    - версии ключевых фреймворков в манифестах против актуальных
+    - renovate/dependabot или регулярные обновления в git log
+  evidence: версии ключевых зависимостей
+
+- id: maint-review-branching
+  area: maintainability
+  title: Изменения проходят ревью, ветки не перетирают друг друга
+  severity: medium
+  profiles: [desktop-tool]
+  check: ask
+  why: Код AI уходит в main без чтения человеком.
+  look_for:
+    - PR-шаблоны, CODEOWNERS, защита ветки; история merge-коммитов
+  evidence: настройки репозитория или ответ владельца
+
+- id: maint-bus-factor
+  area: maintainability
+  title: Собрать, подписать и выпустить релиз может больше одного человека; аккаунты и ключи принадлежат компании
+  severity: high
+  profiles: [desktop-tool]
+  check: ask
+  why: Ключ подписи, сервер обновлений или домен на личном аккаунте одного человека.
+  look_for:
+    - где хранится ключ подписи обновлений, кто владеет репозиторием и сервером обновлений
+  evidence: ответ владельца
+
+- id: maint-licenses
+  area: maintainability
+  title: Лицензии зависимостей совместимы с распространением, своя лицензия соответствует намерению
+  severity: medium
+  profiles: [desktop-tool]
+  check: config
+  why: GPL-зависимость в закрытом продукте или LICENSE, разрешающая то, чего не хотели.
+  look_for:
+    - LICENSE в корне, cargo deny licenses, license-checker
+  evidence: LICENSE и проверка лицензий
+
+- id: maint-privacy-terms
+  area: maintainability
+  title: Документация о данных и условия соответствуют тому, что код реально отправляет наружу
+  severity: medium
+  profiles: [desktop-tool]
+  check: code
+  applies_if: приложение отправляет данные за пределы машины (сеть, облачные модели, телеметрия)
+  why: Обещание «всё локально» нарушено телеметрией или облачной моделью.
+  look_for:
+    - все сетевые вызовы и внешние сервисы против текстов в README/USER_GUIDE/политике
+  evidence: список исходящих данных и где он описан
