@@ -4,7 +4,8 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 import type { CodexJob, CodexState, Limit, Snapshot } from '../types'
 
 const PANE = 'pult'
-const TITLE = 'Пульт'
+// panes get no toolbar icon of their own; the glyph marks the tab instead
+const TITLE = '🎛 Пульт'
 const CODEX_PLUGIN = 'codex@openai-codex'
 // the one model Codex may run on; anything else is refused or put back
 const CODEX_MODEL = 'gpt-6.1-sol'
@@ -185,13 +186,15 @@ const applyCompact = async ($: EngineInterface, target: number | null) => {
   return note
 }
 
+// The same run as typing /compact: queued until the answer in progress ends,
+// with its own lines in the chat. $.session.compact() rejects mid-turn instead.
 const compactNow = async ($: EngineInterface) => {
+  await refreshClaude($, 'Сжимаю контекст… если идёт ответ — сразу после него.')
   try {
-    const done = await $.session.compact()
-    const note = 'skip' in done ? `Компакт отменён: ${done.skip}` : 'Контекст сжат.'
-    await refreshClaude($, note)
-  } catch {
-    await refreshClaude($, 'Сжать можно только между ходами — дождитесь конца ответа.')
+    const ran = await $.command.run({ command: 'compact' })
+    await refreshClaude($, ran.text?.trim() || 'Контекст сжат.')
+  } catch (err) {
+    await refreshClaude($, `Не удалось запустить /compact: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 

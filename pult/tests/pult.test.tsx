@@ -192,6 +192,25 @@ test('the pane shows Claude and Codex and its buttons act, on every surface', as
   }
 })
 
+test('«Сжать сейчас» runs /compact and says what came of it', async ($, on) => {
+  engine(on, freshFiles())
+  let compacted = 0
+  on('command.run', { command: 'compact' }, () => {
+    compacted++
+
+    return { text: 'Compacted. ctrl+o to see full summary' }
+  })
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await $.command.run(typed('pult', ''))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'compact-now' })
+
+  expect(compacted).toBe(1)
+  expect(await ui.find({ type: 'Text', text: /Compacted/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a wrong Codex model is shown and put back to gpt-6.1-sol', async ($, on) => {
   const files = freshFiles()
   files[CONFIG] = 'model = "other-model"\n'
