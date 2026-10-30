@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { CodexJob, CodexState, Limit, Snapshot } from '../types'
+import type { CodexJob, CodexState, Limit, Snapshot, SubAgents, SubRule } from '../types'
 
 const PANE = 'pult'
 // panes get no toolbar icon of their own; the glyph marks the tab instead
@@ -18,6 +18,36 @@ const MAX_WINDOW = 1_000_000
 const FALLBACK_BUFFER = 33_000
 const PRESETS = [200_000, 300_000, 400_000, 500_000, 700_000]
 const DEFAULT_WORDS = ['default', 'off', 'reset', 'auto', 'сброс', 'поумолчанию']
+const KEEP = 'keep'
+const KEEP_OPTION = { value: KEEP, label: 'как есть' }
+const SUB_MODELS = [
+  KEEP_OPTION,
+  { value: 'haiku', label: 'Haiku' },
+  { value: 'sonnet', label: 'Sonnet' },
+  { value: 'opus', label: 'Opus' },
+  { value: 'fable', label: 'Fable' },
+]
+const SUB_EFFORTS = [KEEP_OPTION, ...CODEX_EFFORTS.map(level => ({ value: level, label: level }))]
+// start_session takes a model id where the Agent tool takes an alias
+const MODEL_IDS: Record<string, string> = {
+  haiku: 'claude-haiku-5-5',
+  sonnet: 'claude-sonnet-5-5',
+  opus: 'claude-opus-5-5',
+  fable: 'claude-fable-5-1',
+}
+const START_SESSION = 'mcp__ccd_session__start_session'
+const SUB_STORE = 'subagents'
+const MAX_SUB_RUNS = 5
+// `types` are the agent types of the kind; a type no kind names is `other`
+const SUB_KINDS = [
+  { id: 'scout', label: 'Разведка', hint: 'Explore: поиск по коду и документам', types: ['Explore'], model: 'sonnet', effort: 'low' },
+  { id: 'plan', label: 'Планирование', hint: 'Plan: план реализации', types: ['Plan'], model: 'opus', effort: 'high' },
+  { id: 'code', label: 'Код и общие задачи', hint: 'general-purpose и агенты в worktree', types: ['general-purpose', 'claude'], model: 'sonnet', effort: 'high' },
+  { id: 'review', label: 'Ревью', hint: 'pult:review: проверка готового кода', types: ['pult:review'], model: 'opus', effort: 'high' },
+  { id: 'mech', label: 'Механика', hint: 'pult:mech: однотипные правки по образцу', types: ['pult:mech'], model: 'haiku', effort: 'low' },
+  { id: 'other', label: 'Остальные типы', hint: 'агенты плагинов и свои, Codex в том числе', types: [], model: KEEP, effort: KEEP },
+  { id: 'session', label: 'Отдельные сессии', hint: 'новые сессии приложения: не выше модели и усилия текущей', types: [], model: 'sonnet', effort: 'high' },
+]
 const BRIEF_PROMPT =
   'Сделай короткий бриф для продолжения этой работы в новой сессии: цель, что сделано, ' +
   'текущее состояние, решения и почему, открытые вопросы, следующие шаги, ключевые файлы. ' +
@@ -45,6 +75,14 @@ const codex = atom({ plugin: 'pult', key: 'codex' } as const, {
   result: null,
   note: null,
 } as CodexState)
+const defaultRules = () =>
+  Object.fromEntries(SUB_KINDS.map(k => [k.id, { model: k.model, effort: k.effort }]))
+const subs = atom({ plugin: 'pult', key: 'subs' } as const, {
+  enabled: true,
+  rules: defaultRules(),
+  runs: [],
+  note: null,
+} as SubAgents)
 const isBandHidden = atom({ plugin: 'pult', key: 'isBandHidden' } as const, false)
 const warned = atom({ plugin: 'pult', key: 'warned' } as const, [] as string[])
 
@@ -386,6 +424,83 @@ const jobAction = async ($: EngineInterface, action: 'result' | 'cancel', id: st
   await refreshCodex($, action === 'cancel' ? (out === null ? 'Не удалось отменить.' : 'Задача отменена.') : undefined)
 }
 
+// ---- subagents ----------------------------------------------------------
+
+// agent id -> type; a workflow's agents are in no list, so the spawn notes them
+const agentTypes = new Map<string, string>()
+
+const kindOf = (type: string) => SUB_KINDS.find(k => k.types.includes(type))?.id ?? 'other'
+
+const loadSubs = async ($: EngineInterface) => {
+  const saved = (await $.store.get(SUB_STORE).catch(() => undefined)) as Partial<SubAgents> | undefined
+  await update($, subs, prev => ({
+    ...prev,
+    enabled: saved?.enabled ?? true,
+    rules: { ...defaultRules(), ...saved?.rules },
+  }))
+}
+
+const editSubs = async ($: EngineInterface, change: Partial<SubAgents>, note: string) => {
+  const saved = await update($, subs, prev => ({ ...prev, ...change, note }))
+  await $.store.set(SUB_STORE, { enabled: saved.enabled, rules: saved.rules })
+
+  return saved
+}
+
+const setRule = async ($: EngineInterface, kind: string, change: Partial<SubRule>) => {
+  const { rules } = await read($, subs)
+  const label = SUB_KINDS.find(k => k.id === kind)?.label ?? kind
+  const rule = { ...rules[kind], ...change } as SubRule
+
+  return editSubs(
+    $,
+    { rules: { ...rules, [kind]: rule } },
+    `${label}: ${rule.model} · ${rule.effort}. Действует со следующего запуска.`,
+  )
+}
+
+// The effort a running agent asks for; null leaves the one it inherited.
+const subEffort = async ($: EngineInterface, agentId: string) => {
+  const s = await read($, subs)
+  if (!s.enabled) return null
+  const type =
+    agentTypes.get(agentId) ??
+    (await $.agent.list().catch(() => [])).find(a => a.id === agentId)?.type
+  // a fork shares the parent's cache and stays as it is
+  if (type === undefined || type === 'fork') return null
+  agentTypes.set(agentId, type)
+  const effort = s.rules[kindOf(type)]?.effort
+
+  return effort === undefined || effort === KEEP ? null : effort
+}
+
+const subsText = (s: SubAgents) =>
+  [
+    `Правила сабагентов: ${s.enabled ? 'включены' : 'выключены'}.`,
+    ...SUB_KINDS.map(k => `${k.id} · ${k.label}: ${s.rules[k.id]?.model} · ${s.rules[k.id]?.effort}`),
+    'Сменить: /subagents scout haiku low · /subagents on · /subagents off · /subagents default · панель: /pult',
+  ].join('\n')
+
+const subsCommand = async ($: EngineInterface, args: string) => {
+  const [first, model, effort] = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
+  if (first === undefined) return subsText(await read($, subs))
+  if (first === 'on' || first === 'off') {
+    const enabled = first === 'on'
+
+    return subsText(await editSubs($, { enabled }, enabled ? 'Правила включены.' : 'Правила выключены.'))
+  }
+  if (DEFAULT_WORDS.includes(first)) {
+    return subsText(await editSubs($, { rules: defaultRules() }, 'Правила сброшены к исходным.'))
+  }
+  const isModel = SUB_MODELS.some(m => m.value === model)
+  const isEffort = effort === undefined || SUB_EFFORTS.some(l => l.value === effort)
+  if (!SUB_KINDS.some(k => k.id === first) || !isModel || !isEffort) {
+    return `Не понял «${args.trim()}». Пример: /subagents scout haiku low (keep оставляет как есть).`
+  }
+
+  return subsText(await setRule($, first, { model, ...(effort === undefined ? {} : { effort }) }))
+}
+
 // ---- warnings -----------------------------------------------------------
 
 const warnOnce = async ($: EngineInterface, key: string, text: string) => {
@@ -420,6 +535,7 @@ const checkWarnings = async ($: EngineInterface) => {
 }
 
 const refreshAll = async ($: EngineInterface) => {
+  await loadSubs($)
   await refreshClaude($)
   await refreshCodex($).catch(() => undefined)
   const s = await read($, snap)
@@ -446,6 +562,12 @@ export const register: Register = on => {
       description: 'Порог автокомпакта: без аргумента — сводка, с числом ставит порог',
       argumentHint: '[400k | 0.3m | default]',
     })
+    await $.command.register({
+      name: 'subagents',
+      description: 'Модель и усилие сабагентов по типам задач: без аргумента — сводка',
+      argumentHint: '[scout haiku low | on | off | default]',
+    })
+    await loadSubs($)
     void $.ui.open({ id: PANE, title: TITLE }).catch(() => undefined)
     void refreshAll($).catch(() => undefined)
 
@@ -471,6 +593,55 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // The rule decides what a call left open: a model the call names stands.
+  on('agent.spawn', async ($, e, next) => {
+    const s = await read($, subs)
+    const rule = s.enabled ? s.rules[kindOf(e.subagentType)] : undefined
+    const canPick = !e.fork && e.resume === undefined && e.model === undefined
+    const model = canPick && rule !== undefined && rule.model !== KEEP ? rule.model : undefined
+    const started = await next(model === undefined ? e : { ...e, model })
+    if (e.resume !== undefined || 'deny' in started) return started
+    if (started.agentId !== undefined) agentTypes.set(started.agentId, e.subagentType)
+    const effort = !e.fork && rule !== undefined && rule.effort !== KEEP ? rule.effort : 'наследует'
+    const run = { type: e.subagentType, model: started.model, effort }
+    await update($, subs, prev => ({ ...prev, runs: [run, ...prev.runs].slice(0, MAX_SUB_RUNS) }))
+
+    return started
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    const effort =
+      e.agentId === undefined || e.effort === undefined ? null : await subEffort($, e.agentId)
+
+    return yield* next(effort === null ? e : { ...e, effort: effort as typeof e.effort })
+  })
+
+  // A new session is told its model by the call; the brief-less forms take none.
+  on('tool.call', { tool: START_SESSION }, async ($, e, next) => {
+    const call = e as unknown as Record<string, unknown>
+    const s = await read($, subs)
+    const rule = s.rules.session
+    const isFresh =
+      s.enabled &&
+      typeof call.prompt === 'string' &&
+      call.proposal_id === undefined &&
+      call.context !== 'fork' &&
+      call.target !== 'cloud' &&
+      call.preset === undefined
+    if (!isFresh || rule === undefined) return next(e)
+    const levels = SUB_EFFORTS.map(l => l.value)
+    const current = (await read($, snap)).effort
+    const isWithin = current !== null && levels.indexOf(rule.effort) <= levels.indexOf(current)
+    const model = call.model === undefined && rule.model !== KEEP ? rule.model : undefined
+    const effort = call.effort === undefined && rule.effort !== KEEP && isWithin ? rule.effort : undefined
+
+    return next({
+      ...e,
+      ...(model === undefined ? {} : { model: MODEL_IDS[model] ?? model }),
+      ...(effort === undefined ? {} : { effort }),
+    })
+  })
+
   on('command.run', { command: 'pult' }, async $ => {
     await $.ui.open({ id: PANE, title: TITLE })
     void refreshAll($).catch(() => undefined)
@@ -489,6 +660,12 @@ export const register: Register = on => {
     return { text: await applyCompact($, target) }
   }).catch(($, e, next) =>
     next.called ? next(e) : { text: '/compact-at: не получилось, порог не менял.' },
+  )
+
+  on('command.run', { command: 'subagents' }, async ($, e) => ({
+    text: await subsCommand($, e.args),
+  })).catch(($, e, next) =>
+    next.called ? next(e) : { text: '/subagents: не получилось, правила не менял.' },
   )
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -522,6 +699,7 @@ export const register: Register = on => {
     const Field = !isPhone && 'Input' in elements ? elements.Input : undefined
     const s = await read($, snap)
     const c = await read($, codex)
+    const sub = await read($, subs)
     const bandHidden = await read($, isBandHidden)
     const buffer = s.buffer ?? FALLBACK_BUFFER
     const trigger = triggerOf(s)
@@ -661,6 +839,48 @@ export const register: Register = on => {
                 </Text>,
               ]
             : s.limits.map((l, i) => limit(`claude-${i}`, l))),
+        ])}
+
+        {card('Сабагенты', [
+          choose(
+            'sub-enabled',
+            'Правила',
+            [
+              { value: 'on', label: 'Включены' },
+              { value: 'off', label: 'Выключены' },
+            ],
+            sub.enabled ? 'on' : 'off',
+            v => editSubs($, { enabled: v === 'on' }, v === 'on' ? 'Правила включены.' : 'Правила выключены.'),
+          ),
+          <Text size="caption" dimColor>
+            Модель, названная в самом вызове, важнее правила. Форк всегда идёт на модели родителя.
+          </Text>,
+          ...SUB_KINDS.map(k => (
+            <Box flexDirection="column" gap="xs">
+              <Text weight="medium">{k.label}</Text>
+              <Text size="caption" dimColor>
+                {k.hint}
+              </Text>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                {choose(`sub-model-${k.id}`, 'Модель', SUB_MODELS, sub.rules[k.id]?.model ?? KEEP, v =>
+                  setRule($, k.id, { model: v }),
+                )}
+                {choose(`sub-effort-${k.id}`, 'Усилие', SUB_EFFORTS, sub.rules[k.id]?.effort ?? KEEP, v =>
+                  setRule($, k.id, { effort: v }),
+                )}
+              </Box>
+            </Box>
+          )),
+          ...sub.runs.map(run => (
+            <Text size="caption" dimColor>
+              {run.type} → {run.model} · {run.effort}
+            </Text>
+          )),
+          sub.note !== null ? (
+            <Text size="caption" dimColor>
+              {sub.note}
+            </Text>
+          ) : null,
         ])}
 
         {card('Codex', [

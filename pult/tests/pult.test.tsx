@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { On, SessionUsage } from 'claude-code'
 
 const HOME = 'C:/Users/me'
@@ -209,6 +209,118 @@ test('«Сжать сейчас» runs /compact and says what came of it', async
   expect(compacted).toBe(1)
   expect(await ui.find({ type: 'Text', text: /Compacted/ })).toBeDefined()
   await ui.unmount()
+})
+
+const spawn = { prompt: 'p', description: 'd' }
+
+test('a subagent runs on its kind of work, and the call may name its own model', async ($, on) => {
+  engine(on, freshFiles())
+  mock.store(on)
+  const models: Record<string, string | undefined> = {}
+  on('agent.spawn', (_, e) => {
+    models[e.description] = e.model
+
+    return { model: e.model ?? 'parent', agentId: e.description }
+  })
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+
+  await $.agent.spawn({ ...spawn, subagentType: 'Explore', description: 'scout' })
+  await $.agent.spawn({ ...spawn, subagentType: 'general-purpose', description: 'code' })
+  await $.agent.spawn({ ...spawn, subagentType: 'pult:review', description: 'review' })
+  await $.agent.spawn({ ...spawn, subagentType: 'codex:codex-rescue', description: 'plugin' })
+  await $.agent.spawn({ ...spawn, subagentType: 'Explore', description: 'named', model: 'opus' })
+
+  expect(models).toEqual({ scout: 'sonnet', code: 'sonnet', review: 'opus', plugin: undefined, named: 'opus' })
+})
+
+test('a subagent asks for its rule effort, the main loop and a fork keep theirs', async ($, on) => {
+  engine(on, freshFiles())
+  mock.store(on)
+  const efforts: Record<string, unknown> = {}
+  on('turn.step', async function* (_, e) {
+    efforts[e.agentId ?? 'main'] = e.effort
+
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [] } as never
+  })
+  on('agent.list', () => ({
+    value: [
+      { id: 'listed', description: 'd', type: 'Explore', status: 'running' },
+      { id: 'forked', description: 'd', type: 'fork', status: 'running' },
+    ],
+  }))
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+
+  const step = { turnId: 't', index: 0, model: 'm', effort: 'xhigh', messageCount: 1 } as const
+  for (const agentId of [undefined, 'listed', 'forked', 'unknown']) {
+    for await (const _ of $.turn.step({ ...step, agentId })) void _
+  }
+
+  expect(efforts).toEqual({ main: 'xhigh', listed: 'low', forked: 'xhigh', unknown: 'xhigh' })
+})
+
+test('the pane changes a rule, the store keeps it and /subagents off lifts them all', async ($, on) => {
+  const stored: Record<string, unknown> = {}
+  on('store.get', (_, e) => ({ value: stored[e.key] }))
+  on('store.set', (_, e) => {
+    stored[e.key] = e.value
+
+    return { value: undefined }
+  })
+  engine(on, freshFiles())
+  const models: (string | undefined)[] = []
+  on('agent.spawn', (_, e) => {
+    models.push(e.model)
+
+    return { model: e.model ?? 'parent', agentId: 'a1' }
+  })
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await $.command.run(typed('pult', ''))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
+  await ui.press({ key: 'sub-model-scout-haiku' })
+  await ui.unmount()
+  expect(stored.subagents).toMatchObject({ rules: { scout: { model: 'haiku', effort: 'low' } } })
+
+  await $.agent.spawn({ ...spawn, subagentType: 'Explore' })
+  const summary = await $.command.run(typed('subagents', 'off'))
+  await $.agent.spawn({ ...spawn, subagentType: 'Explore' })
+
+  expect(summary.text).toMatch(/выключены/)
+  expect(models).toEqual(['haiku', undefined])
+})
+
+test('/subagents sets a rule, resets them and refuses what it cannot read', async ($, on) => {
+  engine(on, freshFiles())
+  mock.store(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+
+  expect((await $.command.run(typed('subagents', 'mech sonnet medium'))).text).toMatch(/mech · Механика: sonnet · medium/)
+  expect((await $.command.run(typed('subagents', 'default'))).text).toMatch(/mech · Механика: haiku · low/)
+  expect((await $.command.run(typed('subagents', 'mech gpt'))).text).toMatch(/Не понял/)
+})
+
+test('a new session takes the rule unless the call says otherwise or takes no model', async ($, on) => {
+  const seen: Record<string, unknown>[] = []
+  on('tool.call', { tool: 'mcp__ccd_session__start_session' }, (_, e) => {
+    seen.push(e as unknown as Record<string, unknown>)
+
+    return { result: {} }
+  })
+  engine(on, freshFiles())
+  mock.store(on)
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await $.command.run(typed('compact-at', ''))
+  const call = { tool: 'mcp__ccd_session__start_session', title: 't' } as const
+
+  await $.tool.call({ ...call, prompt: 'brief', initiation: 'user_asked' })
+  await $.tool.call({ ...call, prompt: 'brief', initiation: 'user_asked', model: 'claude-haiku-5-5' })
+  await $.tool.call({ ...call, prompt: 'brief', context: 'fork' })
+  await $.tool.call({ ...call, initiation: 'offer' })
+
+  expect(seen[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' })
+  expect(seen[1]).toMatchObject({ model: 'claude-haiku-5-5' })
+  expect(seen[2]?.model).toBeUndefined()
+  expect(seen[3]?.model).toBeUndefined()
 })
 
 test('a wrong Codex model is shown and put back to gpt-6.1-sol', async ($, on) => {

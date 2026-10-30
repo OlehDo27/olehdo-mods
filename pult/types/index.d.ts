@@ -36,11 +36,26 @@ export type CodexState = {
   note: string | null
 }
 
+// What one kind of work runs on; 'keep' leaves the engine's own choice.
+export type SubRule = { model: string; effort: string }
+
+// One subagent as it started.
+export type SubRun = { type: string; model: string; effort: string }
+
+// The subagent rules, kept across sessions, and the latest starts.
+export type SubAgents = {
+  enabled: boolean
+  rules: Record<string, SubRule>
+  runs: SubRun[]
+  note: string | null
+}
+
 declare module 'claude-code' {
   interface PluginState {
     pult: {
       snap: Snapshot
       codex: CodexState
+      subs: SubAgents
       isBandHidden: boolean
       warned: string[]
     }
